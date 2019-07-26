@@ -1,4 +1,4 @@
-/* OpenSprinkler Unified (AVR/RPI/BBB/LINUX) Firmware
+/* OpenSprinkler Unified (AVR/RPI/BBB/LINUX/ESP8266) Firmware
  * Copyright (C) 2015 by Ray Wang (ray@opensprinkler.com)
  *
  * OpenSprinkler library header file
@@ -25,7 +25,11 @@
 #ifndef _OPENSPRINKLER_H
 #define _OPENSPRINKLER_H
 
-#if defined(ARDUINO) // heades for AVR
+#include "defines.h"
+#include "utils.h"
+#include "gpio.h"
+
+#if defined(ARDUINO) && !defined(ESP8266) // headers for AVR
   #include "Arduino.h"
   #include <avr/eeprom.h>
   #include <Wire.h>
@@ -33,16 +37,23 @@
   #include "Time.h"
   #include "DS1307RTC.h"
   #include "EtherCard.h"
+#elif defined(ESP8266) // headers for ESP8266
+  #include <Wire.h>
+  #include <FS.h>
+  #include <RCSwitch.h>
+	#include <stdlib.h>
+	#include <UIPEthernet.h>
+  #include "SSD1306Display.h"
+  #include "i2crtc.h"
+  #include "espconnect.h"
 #else // headers for RPI/BBB/LINUX
   #include <time.h>
   #include <string.h>
   #include <unistd.h>
+  #include <netdb.h>
   #include "etherport.h"
 #endif // end of headers
-
-#include "defines.h"
-#include "utils.h"
-
+  
 /** Non-volatile data */
 struct NVConData {
   uint16_t sunrise_time;  // sunrise time (in minutes)
@@ -62,6 +73,13 @@ struct RFStationData {
   byte on[6];
   byte off[6];
   byte timing[4];
+};
+
+struct RFStationDataFull {
+  byte on[8];
+  byte off[8];
+  byte timing[4];
+  byte protocol[4];
 };
 
 struct RemoteStationData {
@@ -91,34 +109,35 @@ struct ConStatus {
   byte has_hwmac:1;         // has hardware MAC chip
   byte req_ntpsync:1;       // request ntpsync
   byte req_network:1;       // request check network
-  byte display_board:3;     // the board that is being displayed onto the lcd
-  byte network_fails:3;     // number of network fails
+  byte display_board:4;     // the board that is being displayed onto the lcd
+  byte network_fails:2;     // number of network fails
   byte mas:8;               // master station index
   byte mas2:8;              // master2 station index
 };
 
-#if defined(ARDUINO)
 extern const char wtopts_filename[];
 extern const char stns_filename[];
 extern const char ifkey_filename[];
-extern const char op_max[];
+extern const byte op_max[];
 extern const char op_json_names[];
-#else
-extern const char wtopts_filename[];
-extern const char stns_filename[];
-extern const char ifkey_filename[];
-extern const char op_max[];
-extern const char op_json_names[];
+#ifdef ESP8266
+struct WiFiConfig {
+  byte mode;
+  String ssid;
+  String pass;
+};  
+extern const char wifi_filename[];
 #endif
 
 class OpenSprinkler {
 public:
-
   // data members
-#if defined(ARDUINO)
-  static LiquidCrystal lcd;
+#if defined(ARDUINO) && !defined(ESP8266)
+  static LiquidCrystal lcd; // 16x2 character LCD
+#elif defined(ESP8266)
+  static SSD1306Display lcd;// 128x64 OLED display
 #else
-  // todo: LCD define for RPI
+  // todo: LCD define for RPI/BBB
 #endif
 
 #if defined(OSPI)
@@ -130,8 +149,9 @@ public:
   static ConStatus status;
   static ConStatus old_status;
   static byte nboards, nstations;
-  static byte hw_type;           // hardware type
-
+  static byte hw_type;// hardware type
+  static byte hw_rev; // hardware minor
+  
   static byte options[];  // option values, max, name, and flag
 
   static byte station_bits[];     // station activation bits. each byte corresponds to a board (8 stations)
@@ -139,13 +159,14 @@ public:
 
   // variables for time keeping
   static ulong sensor_lasttime;  // time when the last sensor reading is recorded
-  static ulong flowcount_time_ms;// time stamp when new flow sensor click is received (in milliseconds)
+  static volatile ulong flowcount_time_ms;// time stamp when new flow sensor click is received (in milliseconds)
   static ulong flowcount_rt;     // flow count (for computing real-time flow rate)
   static ulong flowcount_log_start; // starting flow count (for logging)
   static ulong raindelay_start_time;  // time when the most recent rain delay started
   static byte  button_timeout;        // button timeout
   static ulong checkwt_lasttime;      // time when weather was checked
   static ulong checkwt_success_lasttime; // time when weather check was successful
+  static ulong powerup_lasttime;      // time when controller is powered up most recently
   static byte  weather_update_flag; 
   // member functions
   // -- setup
@@ -153,8 +174,9 @@ public:
   static void reboot_dev();   // reboot the microcontroller
   static void begin();        // initialization, must call this function before calling other functions
   static byte start_network();  // initialize network with the given mac and port
+  static byte start_ether();  // initialize ethernet with the given mac and port
 #if defined(ARDUINO)
-  static bool read_hardware_mac();  // read hardware mac address
+  static bool load_hardware_mac(uint8_t*, bool wired=false);  // read hardware mac address
 #endif
   static time_t now_tz();
   // -- station names and attributes
@@ -175,10 +197,10 @@ public:
 
   static void options_setup();
   static void options_load();
-  static void options_save();
+  static void options_save(bool savewifi=false);
 
   static byte password_verify(char *pw);  // verify password
-
+  
   // -- controller operation
   static void enable();           // enable controller operation
   static void disable();          // disable controller operation, all stations will be closed immediately
@@ -186,8 +208,9 @@ public:
   static void raindelay_stop();   // stop rain delay
   static void rainsensor_status();// update rainsensor status
   static bool programswitch_status(ulong); // get program switch status
-#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
+#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
   static uint16_t read_current(); // read current sensing value
+  static uint16_t baseline_current; // resting state current
 #endif
   static int detect_exp();        // detect the number of expansion boards
   static byte weekday_today();    // returns index of today's weekday (Monday is 0)
@@ -199,8 +222,13 @@ public:
 
   // -- LCD functions
 #if defined(ARDUINO) // LCD functions for Arduino
+  #ifdef ESP8266
+  static void lcd_print_pgm(PGM_P str); // ESP8266 does not allow PGM_P followed by PROGMEM
+  static void lcd_print_line_clear_pgm(PGM_P str, byte line);
+  #else
   static void lcd_print_pgm(PGM_P PROGMEM str);           // print a program memory string
   static void lcd_print_line_clear_pgm(PGM_P PROGMEM str, byte line);
+  #endif
   static void lcd_print_time(time_t t);                  // print current time
   static void lcd_print_ip(const byte *ip, byte endian);    // print ip
   static void lcd_print_mac(const byte *mac);             // print mac
@@ -217,13 +245,37 @@ public:
   static void ui_set_options(int oid);    // ui for setting options (oid-> starting option index)
   static void lcd_set_brightness(byte value=1);
   static void lcd_set_contrast();
+
+  #ifdef ESP8266
+  static WiFiConfig wifi_config;
+  static IOEXP *mainio, *drio;
+  static IOEXP *expanders[];
+  static RCSwitch rfswitch;
+  static void detect_expanders();
+  static void flash_screen();
+  static void toggle_screen_led();
+  static void set_screen_led(byte status);  
+  static byte get_wifi_mode() {return wifi_config.mode;}
+  static void config_ip();
+  static void reset_to_ap();
+  static byte state;
+  #endif  
 private:
   static void lcd_print_option(int i);  // print an option to the lcd
   static void lcd_print_2digit(int v);  // print a integer in 2 digits
   static void lcd_start();
   static byte button_read_busy(byte pin_butt, byte waitmode, byte butt, byte is_holding);
-#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
+#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
   static byte engage_booster;
+#endif
+#if defined(ESP8266)
+  static void latch_boost();
+  static void latch_open(byte sid);
+  static void latch_close(byte sid);
+  static void latch_setzonepin(byte sid, byte value);
+  static void latch_setallzonepins(byte value);
+  static void latch_apply_all_station_bits();
+  static byte prev_station_bits[];
 #endif
 #endif // LCD functions
 };

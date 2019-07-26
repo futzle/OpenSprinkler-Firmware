@@ -25,6 +25,135 @@
 
 #if defined(ARDUINO)
 
+#if defined(ESP8266)
+
+#include <Wire.h>
+#include "defines.h"
+
+byte IOEXP::detectType(uint8_t address) {
+  Wire.beginTransmission(address);
+  if(Wire.endTransmission()!=0) return IOEXP_TYPE_NONEXIST; // this I2C address does not exist
+  
+  Wire.beginTransmission(address);
+  Wire.write(NXP_INVERT_REG); // ask for polarity register
+  Wire.endTransmission();
+  
+  if(Wire.requestFrom(address, (uint8_t)2) != 2) return IOEXP_TYPE_UNKNOWN;
+  uint8_t low = Wire.read();
+  uint8_t high = Wire.read();
+  if(low==0x00 && high==0x00) {
+    return IOEXP_TYPE_9555; // PCA9555 has polarity register which inits to 0
+  }
+  return IOEXP_TYPE_8575;  
+}
+
+void PCA9555::pinMode(uint8_t pin, uint8_t IOMode) {
+  uint16_t config = i2c_read(NXP_CONFIG_REG);
+  if(IOMode == OUTPUT) {
+      config &= ~(1 << pin); // config bit set to 0 for output pin
+  } else {
+      config |= (1 << pin);  // config bit set to 1 for input pin
+  }
+  i2c_write(NXP_CONFIG_REG, config);
+}
+
+uint16_t PCA9555::i2c_read(uint8_t reg) {
+  if(address==255)  return 0xFFFF;
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.endTransmission();
+  if(Wire.requestFrom(address, (uint8_t)2) != 2) {DEBUG_PRINTLN("GPIO error"); return 0xFFFF;}
+  uint16_t data0 = Wire.read();
+  uint16_t data1 = Wire.read();
+  return data0+(data1<<8);
+}
+
+void PCA9555::i2c_write(uint8_t reg, uint16_t v){
+  if(address==255)  return;
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(v&0xff);
+  Wire.write(v>>8);
+  Wire.endTransmission();
+}
+
+uint16_t PCF8575::i2c_read(uint8_t reg) {
+  if(address==255)  return 0xFFFF;
+  Wire.beginTransmission(address);
+  if(Wire.requestFrom(address, (uint8_t)2) != 2) return 0xFFFF;
+  uint16_t data0 = Wire.read();
+  uint16_t data1 = Wire.read();
+  Wire.endTransmission();
+  return data0+(data1<<8);
+}
+
+void PCF8575::i2c_write(uint8_t reg, uint16_t v) {
+  if(address==255)  return;
+  Wire.beginTransmission(address);
+  // todo: handle inputmask (not necessary unless if using any pin as input)
+  Wire.write(v&0xff);
+  Wire.write(v>>8);
+  Wire.endTransmission();
+}
+
+uint16_t PCF8574::i2c_read(uint8_t reg) {
+  if(address==255)  return 0xFFFF;
+  Wire.beginTransmission(address);
+  if(Wire.requestFrom(address, (uint8_t)1) != 1) return 0xFFFF;
+  uint16_t data = Wire.read();
+  Wire.endTransmission();
+  return data; 
+}
+
+void PCF8574::i2c_write(uint8_t reg, uint16_t v) {
+  if(address==255)  return;
+  Wire.beginTransmission(address);
+  Wire.write((uint8_t)(v&0xFF) | inputmask);
+  Wire.endTransmission();  
+}
+
+#include "OpenSprinkler.h"
+
+extern OpenSprinkler os;
+
+void pinModeExt(byte pin, byte mode) {
+  if(pin==255) return;
+  if(pin>=IOEXP_PIN) {
+    os.mainio->pinMode(pin-IOEXP_PIN, mode);
+  } else {
+    ::pinMode(pin, mode);
+  }
+}
+
+void digitalWriteExt(byte pin, byte value) {
+  if(pin==255) return;
+  if(pin>=IOEXP_PIN) {
+
+    os.mainio->digitalWrite(pin-IOEXP_PIN, value);
+  /*
+    // a pin on IO expander
+    byte data=pcf_read(MAIN_I2CADDR);
+    if(value) data|=(1<<(pin-IOEXP_PIN));
+    else     data&=~(1<<(pin-IOEXP_PIN));
+    data |= MAIN_INPUTMASK; // make sure to enforce 1 for input pins
+    pcf_write(MAIN_I2CADDR, data);*/
+  } else {
+    ::digitalWrite(pin, value);
+  }
+}
+
+byte digitalReadExt(byte pin) {
+  if(pin==255) return HIGH;
+  if(pin>=IOEXP_PIN) {
+    return os.mainio->digitalRead(pin-IOEXP_PIN);
+    // a pin on IO expander
+    //return pcf_read(MAIN_I2CADDR)&(1<<(pin-IOEXP_PIN));
+  } else {
+    return ::digitalRead(pin);
+  }
+}
+#endif
+
 #elif defined(OSPI) || defined(OSBO)
 
 #include <sys/types.h>
@@ -241,6 +370,7 @@ static void *interruptHandler (void *arg) {
   return NULL ;
 }
 
+#include "utils.h"
 /** Attach an interrupt function to pin */
 void attachInterrupt(int pin, const char* mode, void (*isr)(void)) {
   if((pin<0)||(pin>GPIO_MAX)) {

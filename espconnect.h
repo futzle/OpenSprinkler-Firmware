@@ -1,10 +1,7 @@
-/* OpenSprinkler Unified (AVR/RPI/BBB/LINUX) Firmware
- * Copyright (C) 2015 by Ray Wang (ray@opensprinkler.com)
+/* ESPConnect header file
+ * December 2016 @ opensprinkler.com
  *
- * Main loop wrapper for Arduino
- * Feb 2015 @ OpenSprinkler.com
- *
- * This file is part of the OpenSprinkler Firmware
+ * This file is part of the OpenSprinkler library
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,20 +15,25 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see
- * <http://www.gnu.org/licenses/>. 
+ * <http://www.gnu.org/licenses/>.
  */
- 
-#include <OpenSprinkler.h>
 
-extern OpenSprinkler os;
+#if defined(ESP8266)
 
-void do_setup();
-void do_loop();
+#ifndef _ESP_CONNECT_H
+#define _ESP_CONNECT_H
 
-void setup() {
-  do_setup();
-}
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include "time.h"
+#include "defines.h"
+#include "htmls.h"
 
-void loop() {
-  do_loop();
-}
+String scan_network();
+void start_network_ap(const char *ssid, const char *pass);
+void start_network_sta(const char *ssid, const char *pass);
+void start_network_sta_with_ap(const char *ssid, const char *pass);
+#endif
+
+#endif

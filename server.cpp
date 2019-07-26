@@ -23,31 +23,55 @@
 
 #include "OpenSprinkler.h"
 #include "program.h"
+#include "server.h"
 
 // External variables defined in main ion file
 #if defined(ARDUINO)
 
-#include "SdFat.h"
-extern SdFat sd;
-static uint8_t ntpclientportL = 123; // Default NTP client port
-extern ulong flow_count;
+  #ifdef ESP8266
+
+    #include <FS.h>
+    #include "espconnect.h"
+    #define INSERT_DELAY(x) {}
+    
+    extern ESP8266WebServer *wifi_server;
+	  extern EthernetServer *m_server;
+	  extern EthernetClient *m_client;
+    extern char ether_buffer[];
+    #define handle_return(x) {if(m_client) {return_code=x; return;} else {if(x==HTML_OK) server_send_html(ether_buffer); else server_send_result(x); return;}}
+
+  #else
+
+    #include "SdFat.h"
+    extern SdFat sd;
+    #define handle_return(x) {return_code=x; return;}
+    #define INSERT_DELAY(x) delay(x)
+  #endif
+
+  static uint8_t ntpclientportL = 123; // Default NTP client port
 
 #else
 
-#include <stdarg.h>
-#include <stdlib.h>
-#include "etherport.h"
-#include "server.h"
+  #include <stdarg.h>
+  #include <stdlib.h>
+  #include "etherport.h"
 
-extern char ether_buffer[];
-extern EthernetClient *m_client;
+  extern char ether_buffer[];
+  extern EthernetClient *m_client;
+  #define handle_return(x) {return_code=x; return;}
+  #define INSERT_DELAY(x) {}
 
 #endif
 
-extern BufferFiller bfill;
 extern char tmp_buffer[];
 extern OpenSprinkler os;
 extern ProgramData pd;
+extern ulong flow_count;
+
+static int return_code;
+static char* get_buffer = NULL;
+
+BufferFiller bfill;
 
 void schedule_all_stations(ulong curr_time);
 void turn_off_station(byte sid, ulong curr_time);
@@ -60,7 +84,11 @@ void delete_log(char *name);
 void reset_all_stations_immediate();
 void reset_all_stations();
 void make_logfile_name(char *name);
-int available_ether_buffer();
+
+/* Check available space (number of bytes) in the Ethernet buffer */
+int available_ether_buffer() {
+  return ETHER_BUFFER_SIZE - (int)bfill.position();
+}
 
 // Define return error code
 #define HTML_OK                0x00
@@ -73,6 +101,7 @@ int available_ether_buffer();
 #define HTML_RFCODE_ERROR      0x13
 #define HTML_PAGE_NOT_FOUND    0x20
 #define HTML_NOT_PERMITTED     0x30
+#define HTML_UPLOAD_FAILED     0x40
 #define HTML_REDIRECT_HOME     0xFF
 
 static const char html200OK[] PROGMEM =
@@ -110,17 +139,61 @@ static const char htmlReturnHome[] PROGMEM =
 
 #if defined(ARDUINO)
 void print_html_standard_header() {
+#ifdef ESP8266
+  if (m_client) {
+    bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentHTML, htmlNoCache, htmlAccessControl);
+    return;
+  }
+  // else
+  wifi_server->sendHeader("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
+  wifi_server->sendHeader("Access-Control-Allow-Origin", "*");
+#else
   bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentHTML, htmlNoCache, htmlAccessControl);
+#endif
 }
 
 void print_json_header(bool bracket=true) {
+#ifdef ESP8266
+  if (m_client) {
+    bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
+    if(bracket) bfill.emit_p(PSTR("{"));
+    return;
+  }
+  // else
+  wifi_server->sendHeader("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
+  wifi_server->sendHeader("Content-Type", "application/json");
+  wifi_server->sendHeader("Access-Control-Allow-Origin", "*");
+#else
   bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
+#endif
   if(bracket) bfill.emit_p(PSTR("{"));
 }
 
 byte findKeyVal (const char *str,char *strbuf, uint8_t maxlen,const char *key,bool key_in_pgm=false,uint8_t *keyfound=NULL)
 {
   uint8_t found=0;
+  
+#ifdef ESP8266
+  // for ESP8266: there are two cases:
+  // case 1: if str is NULL, we assume the key-val to search is already parsed in wifi_server
+  if(str==NULL) {
+    char _key[10];
+    if(key_in_pgm) strcpy_P(_key, key);
+    else strcpy(_key, key);
+    
+    if(wifi_server->hasArg(_key)) {
+      // copy value to buffer, and make sure it ends properly
+      strncpy(strbuf, wifi_server->arg(_key).c_str(), maxlen);
+      strbuf[maxlen-1]=0;
+      found=1;
+    } else {
+      strbuf[0]=0;
+    }
+    if (keyfound) *keyfound = found;
+    return strlen(strbuf);
+  }
+#endif
+  // case 2: otherwise, assume the key-val is stored in str
   uint8_t i=0;
   const char *kp;
   kp=key;
@@ -160,13 +233,18 @@ byte findKeyVal (const char *str,char *strbuf, uint8_t maxlen,const char *key,bo
   }
   if (found==1){
     // copy the value to a buffer and terminate it with '\0'
-    while(*str &&  *str!=' ' && *str!='\n' && *str!='&' && i<maxlen-1){
+    while(*str &&  *str!=' ' && *str!='\r' && *str!='\n' && *str!='&' && i<maxlen-1){
       *strbuf=*str;
       i++;
       str++;
       strbuf++;
     }
-    *strbuf='\0';
+    if (!(*str) || *str == ' ' || *str == '\r' || *str == '\n' || *str == '&') {
+      *strbuf = '\0';
+    } else {
+      found = 0;  // Ignore partial values i.e. value length is larger than maxlen
+      i = 0;
+    }
   }
   // return the length of the value
   if (keyfound) *keyfound = found;
@@ -174,21 +252,39 @@ byte findKeyVal (const char *str,char *strbuf, uint8_t maxlen,const char *key,bo
 }
 
 void rewind_ether_buffer() {
+#ifdef ESP8266
+  bfill = ether_buffer;
+#else
   bfill = ether.tcpOffset();
+#endif
 }
 
 void send_packet(bool final=false) {
+#ifdef ESP8266
+  if (m_client) {
+    m_client->write((const uint8_t *)ether_buffer, strlen(ether_buffer));
+    if (final)
+      m_client->stop();
+    else
+      rewind_ether_buffer();
+    return;
+  }
+  // else
+  if(final || available_ether_buffer()<250) {
+    wifi_server->sendContent(ether_buffer);
+    if(final)
+      wifi_server->client().stop();      
+    else
+      rewind_ether_buffer();
+  }  
+#else
   if(final) {
     ether.httpServerReply_with_flags(bfill.position(), TCP_FLAGS_ACK_V|TCP_FLAGS_FIN_V);
   } else {
     ether.httpServerReply_with_flags(bfill.position(), TCP_FLAGS_ACK_V);
     bfill=ether.tcpOffset();
   }
-}
-
-/* Check available space (number of bytes) in the Ethernet buffer */
-int available_ether_buffer() {
-  return ETHER_BUFFER_SIZE - (int)bfill.position();
+#endif
 }
 
 #else
@@ -238,52 +334,16 @@ byte findKeyVal (const char *str,char *strbuf, uint8_t maxlen,const char *key,bo
       str++;
       strbuf++;
     }
-    *strbuf='\0';
+    if (!(*str) ||  *str == ' ' || *str == '\n' || *str == '&') {
+      *strbuf = '\0';
+    } else {
+      found = 0;  // Ignore partial values i.e. value length is larger than maxlen
+      i = 0;
+    }
   }
   // return the length of the value
   if (keyfound) *keyfound = found;
   return(i);
-}
-
-
-void BufferFiller::emit_p(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  for (;;) {
-    char c = *fmt++;
-    if (c == 0)
-      break;
-    if (c != '$') {
-      *ptr++ = c;
-      continue;
-    }
-    c = *fmt++;
-    switch (c) {
-    case 'D':
-      itoa(va_arg(ap, int), (char*) ptr, 10);  // ray
-      break;
-    case 'L':
-      ultoa(va_arg(ap, long), (char*) ptr, 10); // ray
-      break;
-    case 'S':
-    case 'F':
-      strcpy((char*) ptr, va_arg(ap, const char*));
-      break;
-    case 'E': {
-      byte* s = va_arg(ap, byte*);
-      char d;
-      while ((d = nvm_read_byte(s++)) != 0)
-        *ptr++ = d;
-      continue;
-    }
-    default:
-      *ptr++ = c;
-      continue;
-    }
-    ptr += strlen((char*) ptr);
-  }
-  *(ptr)=0;
-  va_end(ap);
 }
 
 void rewind_ether_buffer() {
@@ -298,9 +358,6 @@ void send_packet(bool final=false) {
     rewind_ether_buffer();
 }
 
-int available_ether_buffer() {
-  return ETHER_BUFFER_SIZE - (int)bfill.position();
-}
 #endif
 
 /** Convert a single hex digit character to its integer value */
@@ -321,6 +378,7 @@ unsigned char h2int(char c)
 /** Decode a url string e.g "hello%20joe" or "hello+joe" becomes "hello joe" */
 void urlDecode (char *urlbuf)
 {
+    if(!urlbuf) return;
     char c;
     char *dst = urlbuf;
     while ((c = *urlbuf) != 0) {
@@ -335,17 +393,202 @@ void urlDecode (char *urlbuf)
     *dst = '\0';
 }
 
+#ifdef ESP8266
+String two_digits(uint8_t x) {
+  return String(x/10) + (x%10);
+}
+
+String toHMS(ulong t) {
+  return two_digits(t/3600)+":"+two_digits((t/60)%60)+":"+two_digits(t%60);
+}
+
+void server_send_html(String html) {
+  if (m_client) {
+    /*if (html.length()>0)
+      bfill.emit_p(html.c_str());
+    DEBUG_PRINTLN("OUT=");
+    DEBUG_PRINTLN(ether_buffer);
+    m_client->write(ether_buffer, strlen(ether_buffer));*/
+    return;
+  }
+  // else
+  wifi_server->send(200, "text/html", html);
+}
+
+void server_send_json(String json) {
+  if (m_client) {
+    /*if (json.length()>0)
+      bfill.emit_p(json.c_str());
+    DEBUG_PRINTLN("OUT=");
+    DEBUG_PRINTLN(ether_buffer);
+    m_client->write(ether_buffer, strlen(ether_buffer));*/
+    return;
+  }
+  // else
+  wifi_server->send(200, "application/json", json);
+}
+
+void server_send_result(byte code) {
+  rewind_ether_buffer();
+  String html = F("{\"result\":");
+  html += code;
+  html += "}";
+//  print_html_standard_header();
+  print_json_header(false);
+  server_send_json(html);
+}
+
+void server_send_result(byte code, const char* item) {
+  rewind_ether_buffer();
+  String html = F("{\"result\":");
+  html += code;
+  html += F(",\"item\":\"");
+  if(item) html += item;
+  html += "\"";
+  html += "}";
+  print_json_header(false);
+  server_send_json(html);
+}
+
+bool get_value_by_key(const char* key, long& val) {
+  if(wifi_server->hasArg(key)) {
+    val = wifi_server->arg(key).toInt();   
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool get_value_by_key(const char* key, String& val) {
+  if(wifi_server->hasArg(key)) {
+    val = wifi_server->arg(key);   
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void append_key_value(String& html, const char* key, const ulong value) {
+  html += "\"";
+  html += key;
+  html += "\":";
+  html += value;
+  html += ",";
+}
+
+void append_key_value(String& html, const char* key, const int16_t value) {
+  html += "\"";
+  html += key;
+  html += "\":";
+  html += value;
+  html += ",";
+}
+
+void append_key_value(String& html, const char* key, const String& value) {
+  html += "\"";
+  html += key;
+  html += "\":\"";
+  html += value;
+  html += "\",";
+}
+
+char dec2hexchar(byte dec) {
+  if(dec<10) return '0'+dec;
+  else return 'A'+(dec-10);
+}
+
+String get_ap_ssid() {
+  static String ap_ssid;
+  if(!ap_ssid.length()) {
+    byte mac[6];
+    WiFi.macAddress(mac);
+    ap_ssid += "OS_";
+    for(byte i=3;i<6;i++) {
+      ap_ssid += dec2hexchar((mac[i]>>4)&0x0F);
+      ap_ssid += dec2hexchar(mac[i]&0x0F);
+    }
+  }
+  return ap_ssid;
+}
+
+static String scanned_ssids;
+
+void on_ap_home() {
+  if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
+  server_send_html(FPSTR(ap_home_html));
+}
+
+void on_ap_scan() {
+  if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
+  server_send_html(scanned_ssids);
+}
+
+void on_ap_change_config() {
+  if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
+  if(wifi_server->hasArg("ssid")&&wifi_server->arg("ssid").length()!=0) {
+    os.wifi_config.ssid = wifi_server->arg("ssid");
+    os.wifi_config.pass = wifi_server->arg("pass");
+    os.options_save(true);
+    server_send_result(HTML_SUCCESS);
+    os.state = OS_STATE_TRY_CONNECT;
+    os.lcd.setCursor(0, 2);
+    os.lcd.print(F("Connecting..."));
+  } else {
+    server_send_result(HTML_DATA_MISSING, "ssid");
+  }
+}
+
+void on_ap_try_connect() {
+  if(os.get_wifi_mode()!=WIFI_MODE_AP) return;
+  String html = "{";
+  ulong ip = (WiFi.status()==WL_CONNECTED)?(uint32_t)WiFi.localIP():0;
+  append_key_value(html, "ip", ip);
+  html.remove(html.length()-1);  
+  html += "}";
+  server_send_html(html);
+  if(WiFi.status() == WL_CONNECTED && WiFi.localIP()) {
+    // IP received by client, restart
+    os.reboot_dev();
+  }  
+}
+
+#endif
+
+
 /** Check and verify password */
+#ifdef ESP8266
+boolean process_password(boolean fwv_on_fail=false, char *p = NULL)
+#else
 boolean check_password(char *p)
+#endif
 {
+#if defined(DEMO)
+	return true;
+#endif
   if (os.options[OPTION_IGNORE_PASSWORD])  return true;
+  if (m_client && !p) {
+    p = get_buffer;
+  }
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pw"), true)) {
     urlDecode(tmp_buffer);
     if (os.password_verify(tmp_buffer))
       return true;
   }
+#ifdef ESP8266
+  if(m_client) { return false; }
+  /* some pages will output fwv if password check has failed */
+ 	if(fwv_on_fail) {
+	  rewind_ether_buffer();
+	  print_json_header();
+	  bfill.emit_p(PSTR("\"$F\":$D}"), op_json_names+0, os.options[0]);
+	  server_send_html(ether_buffer);
+	} else {
+	  server_send_result(HTML_UNAUTHORIZED);
+	}
+#endif
   return false;
 }
+
 
 void server_json_stations_attrib(const char* name, int addr)
 {
@@ -367,13 +610,12 @@ void server_json_stations_main()
   server_json_stations_attrib(PSTR("masop2"), ADDR_NVM_MAS_OP_2);
   server_json_stations_attrib(PSTR("stn_dis"), ADDR_NVM_STNDISABLE);
   server_json_stations_attrib(PSTR("stn_seq"), ADDR_NVM_STNSEQ);
-#if defined(ARDUINO)  // only output stn_spe if it's supported
+  
+  // only output stn_spe if it's supported
   if (os.status.has_sd) {
     server_json_stations_attrib(PSTR("stn_spe"), ADDR_NVM_STNSPE);
   }
-#else
-  server_json_stations_attrib(PSTR("stn_spe"), ADDR_NVM_STNSPE);
-#endif
+
   bfill.emit_p(PSTR("\"snames\":["));
   byte sid;
   for(sid=0;sid<os.nstations;sid++) {
@@ -386,22 +628,30 @@ void server_json_stations_main()
     }
   }
   bfill.emit_p(PSTR("],\"maxlen\":$D}"), STATION_NAME_SIZE);
-  delay(1);
+  INSERT_DELAY(1);
 }
 
 /** Output stations data */
-byte server_json_stations(char *p) {
+void server_json_stations() {
+#ifdef ESP8266
+  if(!process_password()) return;
+  rewind_ether_buffer();
+#endif
   print_json_header();
   server_json_stations_main();
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
 /** Output station special attribute */
-byte server_json_station_special(char *p) {
-#if defined(ARDUINO)
+void server_json_station_special() {
   // if no sd card, return false
-  if (!os.status.has_sd)  return HTML_PAGE_NOT_FOUND;
+  if (!os.status.has_sd)  handle_return(HTML_PAGE_NOT_FOUND);
+
+#ifdef ESP8266
+  if(!process_password()) return;
+  rewind_ether_buffer();
 #endif
+
   byte sid;
   byte comma=0;
   int stepsize=sizeof(StationSpecialData);
@@ -416,10 +666,11 @@ byte server_json_station_special(char *p) {
     }
   }
   bfill.emit_p(PSTR("}"));
-  delay(1);
-  return HTML_OK;
+  INSERT_DELAY(1);
+  handle_return(HTML_OK);
 }
 
+// todo: parse http / special stations
 void server_change_stations_attrib(char *p, char header, int addr)
 {
   byte attrib[MAX_EXT_BOARDS+1];
@@ -449,8 +700,15 @@ void server_change_stations_attrib(char *p, char header, int addr)
  * q?: station sequeitnal bit field
  * p?: station special flag bit field
  */
-byte server_change_stations(char *p)
-{
+void server_change_stations() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
   byte sid;
   char tbuf2[4] = {'s', 0, 0, 0};
   // process station names
@@ -467,25 +725,23 @@ byte server_change_stations(char *p)
   server_change_stations_attrib(p, 'n', ADDR_NVM_MAS_OP_2); // master2
   server_change_stations_attrib(p, 'd', ADDR_NVM_STNDISABLE); // disable
   server_change_stations_attrib(p, 'q', ADDR_NVM_STNSEQ); // sequential
-#if defined(ARDUINO)  // only parse station special bits if it's supported
+  // only parse station special bits if it's supported
   if(os.status.has_sd) {
     server_change_stations_attrib(p, 'p', ADDR_NVM_STNSPE); // special
   }
-#else
-  server_change_stations_attrib(p, 'p', ADDR_NVM_STNSPE); // special
-#endif
+
   /* handle special data */
   if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
     sid = atoi(tmp_buffer);
-    if(sid<0 || sid>os.nstations) return HTML_DATA_OUTOFBOUND;
+    if(sid<0 || sid>os.nstations) handle_return(HTML_DATA_OUTOFBOUND);
     if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("st"), true) &&
        findKeyVal(p, tmp_buffer+1, TMP_BUFFER_SIZE-1, PSTR("sd"), true)) {
       int stepsize=sizeof(StationSpecialData);
       tmp_buffer[0]-='0';
       tmp_buffer[stepsize-1] = 0;
 
-#if !defined(ARDUINO) || defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
-      // only process GPIO and HTTP stations for OS 2.3 and OSPi
+#if !defined(ARDUINO) || defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
+      // only process GPIO and HTTP stations for OS 2.3, above, and OSPi
 	    if(tmp_buffer[0] == STN_TYPE_GPIO) {
         // check that pin does not clash with OSPi pins
 		    byte gpio = (tmp_buffer[1] - '0') * 10 + tmp_buffer[2] - '0';
@@ -496,11 +752,15 @@ byte server_change_stations(char *p)
 		    for (int i = 0; i < sizeof(gpioList) && found == false; i++) {
 			    if (gpioList[i] == gpio) found = true;
 		    }
-		    if (!found || activeState > 1) return HTML_DATA_OUTOFBOUND;
+		    if (!found || activeState > 1) handle_return(HTML_DATA_OUTOFBOUND);
 	    } else if (tmp_buffer[0] == STN_TYPE_HTTP) {
-		    urlDecode(tmp_buffer + 1); // Unwind any url encoding of special data
+        #if defined(ESP8266)  // ESP8266 performs automatic decoding so no need to do it again
+		      if(m_server) urlDecode(tmp_buffer + 1);
+        #else
+	        urlDecode(tmp_buffer + 1);
+	      #endif
 		    if (strlen(tmp_buffer+1) > sizeof(HTTPStationData)) {
-			    return HTML_DATA_OUTOFBOUND;
+			    handle_return(HTML_DATA_OUTOFBOUND);
 		    }
 	    }
 #endif
@@ -509,11 +769,11 @@ byte server_change_stations(char *p)
 
     } else {
 
-      return HTML_DATA_MISSING;
+      handle_return(HTML_DATA_MISSING);
 
     }
   }
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 /** Parse one number from a comma separate list */
@@ -541,13 +801,22 @@ void manual_start_program(byte, byte);
  * pid: program index (0 refers to the first program)
  * uwt: use weather (i.e. watering percentage)
  */
-byte server_manual_program(char *p) {
+void server_manual_program() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
+
   if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
-    return HTML_DATA_MISSING;
+    handle_return(HTML_DATA_MISSING);
 
   int pid=atoi(tmp_buffer);
   if (pid < 0 || pid >= pd.nprograms) {
-    return HTML_DATA_OUTOFBOUND;
+    handle_return(HTML_DATA_OUTOFBOUND);
   }
 
   byte uwt = 0;
@@ -560,8 +829,7 @@ byte server_manual_program(char *p) {
 
   manual_start_program(pid+1, uwt);
 
-  return HTML_SUCCESS;
-
+  handle_return(HTML_SUCCESS);
 }
 
 /**
@@ -571,10 +839,20 @@ byte server_manual_program(char *p) {
  * pw: password
  * t:  station water time
  */
-byte server_change_runonce(char *p) {
+void server_change_runonce() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+  if(!findKeyVal(p,tmp_buffer,TMP_BUFFER_SIZE, "t",false)) handle_return(HTML_DATA_MISSING);
+  char *pv = tmp_buffer+1;
+#else
+  char* p = get_buffer;
+  
   // decode url first
-  urlDecode(p);
-  // search for the start of v=[
+  if(p) urlDecode(p);
+  // search for the start of t=[
   char *pv;
   boolean found=false;
   for(pv=p;(*pv)!=0 && pv<p+100;pv++) {
@@ -583,8 +861,9 @@ byte server_change_runonce(char *p) {
       break;
     }
   }
-  if(!found)  return HTML_DATA_MISSING;
+  if(!found)  handle_return(HTML_DATA_MISSING);
   pv+=3;
+#endif
 
   // reset all stations and prepare to run one-time program
   reset_all_stations_immediate();
@@ -611,10 +890,10 @@ byte server_change_runonce(char *p) {
   }
   if(match_found) {
     schedule_all_stations(os.now_tz());
-    return HTML_SUCCESS;
+    handle_return(HTML_SUCCESS);
   }
 
-  return HTML_DATA_MISSING;
+  handle_return(HTML_DATA_MISSING);
 }
 
 
@@ -625,9 +904,17 @@ byte server_change_runonce(char *p) {
  * pw: password
  * pid:program index (-1 will delete all programs)
  */
-byte server_delete_program(char *p) {
+void server_delete_program() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
   if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
-    return HTML_DATA_MISSING;
+    handle_return(HTML_DATA_MISSING);
 
   int pid=atoi(tmp_buffer);
   if (pid == -1) {
@@ -635,10 +922,10 @@ byte server_delete_program(char *p) {
   } else if (pid < pd.nprograms) {
     pd.del(pid);
   } else {
-    return HTML_DATA_OUTOFBOUND;
+    handle_return(HTML_DATA_OUTOFBOUND);
   }
 
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 /**
@@ -648,16 +935,26 @@ byte server_delete_program(char *p) {
  * pw:  password
  * pid: program index (must be 1 or larger, because we can't move up program 0)
 */
-byte server_moveup_program(char *p) {
-  if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true)) {
-    return HTML_DATA_MISSING;
-  }
+void server_moveup_program() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
+
+  if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true))
+    handle_return(HTML_DATA_MISSING);
+    
   int pid=atoi(tmp_buffer);
-  if (!(pid>=1 && pid< pd.nprograms)) return HTML_DATA_OUTOFBOUND;
+  if (!(pid>=1 && pid< pd.nprograms))
+    handle_return(HTML_DATA_OUTOFBOUND);
 
   pd.moveup(pid);
 
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 /**
@@ -672,18 +969,40 @@ byte server_moveup_program(char *p) {
  * name:  program name
 */
 const char _str_program[] PROGMEM = "Program ";
-byte server_change_program(char *p) {
+void server_change_program() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
+
   byte i;
 
   ProgramStruct prog;
 
   // parse program index
-  if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true)) {
-    return HTML_DATA_MISSING;
-  }
+  if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pid"), true)) handle_return(HTML_DATA_MISSING);
+  
   int pid=atoi(tmp_buffer);
-  if (!(pid>=-1 && pid< pd.nprograms)) return HTML_DATA_OUTOFBOUND;
+  if (!(pid>=-1 && pid< pd.nprograms)) handle_return(HTML_DATA_OUTOFBOUND);
 
+  // check if "en" parameter is present
+  if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
+    if(pid<0) handle_return(HTML_DATA_OUTOFBOUND);
+    pd.set_flagbit(pid, PROGRAMSTRUCT_EN_BIT, (tmp_buffer[0]=='0')?0:1);
+    handle_return(HTML_SUCCESS);
+  }
+
+  // check if "uwt" parameter is present
+  if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
+    if(pid<0) handle_return(HTML_DATA_OUTOFBOUND);
+    pd.set_flagbit(pid, PROGRAMSTRUCT_UWT_BIT, (tmp_buffer[0]=='0')?0:1);
+    handle_return(HTML_SUCCESS);
+  }
+  
   // parse program name
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("name"), true)) {
     urlDecode(tmp_buffer);
@@ -694,8 +1013,12 @@ byte server_change_program(char *p) {
   }
 
   // do a full string decoding
-  urlDecode(p);
+  if(p) urlDecode(p);
 
+#ifdef ESP8266
+  if(!findKeyVal(p,tmp_buffer,TMP_BUFFER_SIZE, "v",false)) handle_return(HTML_DATA_MISSING);
+  char *pv = tmp_buffer+1;  
+#else
   // parse ad-hoc v=[...
   // search for the start of v=[
   char *pv;
@@ -708,8 +1031,10 @@ byte server_change_program(char *p) {
     }
   }
 
-  if(!found)  return HTML_DATA_MISSING;
+  if(!found)  handle_return(HTML_DATA_MISSING);
   pv+=3;
+#endif
+  
   // parse headers
   *(char*)(&prog) = parse_listdata(&pv);
   prog.days[0]= parse_listdata(&pv);
@@ -740,13 +1065,11 @@ byte server_change_program(char *p) {
   }
 
   if (pid==-1) {
-    if(!pd.add(&prog))
-      return HTML_DATA_OUTOFBOUND;
+    if(!pd.add(&prog)) handle_return(HTML_DATA_OUTOFBOUND);
   } else {
-    if(!pd.modify(pid, &prog))
-      return HTML_DATA_OUTOFBOUND;
+    if(!pd.modify(pid, &prog)) handle_return(HTML_DATA_OUTOFBOUND);
   }
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 void server_json_options_main() {
@@ -764,9 +1087,9 @@ void server_json_options_main() {
         oid==OPTION_STATION_DELAY_TIME) {
       v=water_time_decode_signed(v);
     }
-    #if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
+    #if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
     if (oid==OPTION_BOOST_TIME) {
-      if (os.hw_type==HW_TYPE_AC) continue;
+      if (os.hw_type==HW_TYPE_AC || os.hw_type==HW_TYPE_UNKNOWN) continue;
       else v<<=2;
     }
     #else
@@ -776,33 +1099,41 @@ void server_json_options_main() {
     if (oid==OPTION_SEQUENTIAL_RETIRED) continue;
     if (oid==OPTION_DEVICE_ID && os.status.has_hwmac) continue; // do not send DEVICE ID if hardware MAC exists
    
-#if defined(ARDUINO) 
+#if defined(ARDUINO)
+    #ifdef ESP8266
+      if(oid==OPTION_LCD_CONTRAST || oid==OPTION_LCD_BACKLIGHT || oid==OPTION_LCD_DIMMING) continue;
+    #else
     if (os.lcd.type() == LCD_I2C) {
       // for I2C type LCD, we can't adjust contrast or backlight
       if(oid==OPTION_LCD_CONTRAST || oid==OPTION_LCD_BACKLIGHT) continue;
     }
+    #endif
 #endif
 
     // each json name takes 5 characters
     strncpy_P0(tmp_buffer, op_json_names+oid*5, 5);
-    bfill.emit_p(PSTR("\"$S\":$D"),
-                 tmp_buffer, v);
+    bfill.emit_p(PSTR("\"$S\":$D"), tmp_buffer, v);
     if(oid!=NUM_OPTIONS-1)
       bfill.emit_p(PSTR(","));
   }
 
   bfill.emit_p(PSTR(",\"dexp\":$D,\"mexp\":$D,\"hwt\":$D}"), os.detect_exp(), MAX_EXT_BOARDS, os.hw_type);
-  delay(1);
+  INSERT_DELAY(1);
 }
 
 /** Output Options */
-byte server_json_options(char *p) {
+void server_json_options() {
+#ifdef ESP8266
+  if(!process_password(true)) return;
+  rewind_ether_buffer();
+#endif
   print_json_header();
   server_json_options_main();
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
 void server_json_programs_main() {
+
   bfill.emit_p(PSTR("\"nprogs\":$D,\"nboards\":$D,\"mnp\":$D,\"mnst\":$D,\"pnsize\":$D,\"pd\":["),
                pd.nprograms, os.nboards, MAX_NUMBER_PROGRAMS, MAX_NUM_STARTTIMES, PROGRAM_NAME_SIZE);
   byte pid, i;
@@ -841,31 +1172,40 @@ void server_json_programs_main() {
     }
   }
   bfill.emit_p(PSTR("]}"));
-  delay(1);
+  INSERT_DELAY(1);
 }
 
 /** Output program data */
-byte server_json_programs(char *p) {
+void server_json_programs() {
+#ifdef ESP8266
+  if(!process_password()) return;
+  rewind_ether_buffer();
+#endif
+
   print_json_header();
   server_json_programs_main();
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
 /** Output script url form */
-byte server_view_scripturl(char *p) {
+void server_view_scripturl() {
+#ifdef ESP8266
+  // no authenticaion needed
+  rewind_ether_buffer();
+#endif
+
   print_html_standard_header();
   bfill.emit_p(PSTR("<form name=of action=cu method=get><table cellspacing=\"12\"><tr><td><b>JavaScript</b>:</td><td><input type=text size=40 maxlength=40 value=\"$E\" name=jsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Weather</b>:</td><td><input type=text size=40 maxlength=40 value=\"$E\" name=wsp></td></tr><tr><td>Default:</td><td>$S</td></tr><tr><td><b>Password</b>:</td><td><input type=password size=32 name=pw> <input type=submit></td></tr></table></form><script src=https://ui.opensprinkler.com/js/hasher.js></script>"), ADDR_NVM_JAVASCRIPTURL, DEFAULT_JAVASCRIPT_URL, ADDR_NVM_WEATHERURL, DEFAULT_WEATHER_URL);
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
-extern ulong flow_count;
 void server_json_controller_main() {
   byte bid, sid;
   ulong curr_time = os.now_tz();
   //os.nvm_string_get(ADDR_NVM_LOCATION, tmp_buffer);
   bfill.emit_p(PSTR("\"devt\":$L,\"nbrd\":$D,\"en\":$D,\"rd\":$D,\"rs\":$D,\"rdst\":$L,"
                     "\"loc\":\"$E\",\"wtkey\":\"$E\",\"sunrise\":$D,\"sunset\":$D,\"eip\":$L,\"lwc\":$L,\"lswc\":$L,"
-                    "\"lrun\":[$D,$D,$D,$L],"),
+                    "\"lupt\":$L,\"lrun\":[$D,$D,$D,$L],"),
               curr_time,
               os.nboards,
               os.status.enabled,
@@ -879,17 +1219,20 @@ void server_json_controller_main() {
               os.nvdata.external_ip,
               os.checkwt_lasttime,
               os.checkwt_success_lasttime,
+              os.powerup_lasttime,
               pd.lastrun.station,
               pd.lastrun.program,
               pd.lastrun.duration,
               pd.lastrun.endtime);
 
-#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
+#if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
   if(os.status.has_curr_sense) {
-    bfill.emit_p(PSTR("\"curr\":$D,"), os.read_current());
+    uint16_t current = os.read_current();
+    if((!os.status.program_busy) && (current<os.baseline_current)) current=0;
+    bfill.emit_p(PSTR("\"curr\":$D,"), current);
   }
 #endif
-  if(os.options[OPTION_SENSOR_TYPE]==SENSOR_TYPE_FLOW) {
+  if(os.options[OPTION_SENSOR1_TYPE]==SENSOR_TYPE_FLOW) {
     bfill.emit_p(PSTR("\"flcrt\":$L,\"flwrt\":$D,"), os.flowcount_rt, FLOWCOUNT_RT_WINDOW);
   }
 
@@ -921,39 +1264,53 @@ void server_json_controller_main() {
     bfill.emit_p(PSTR(",\"wto\":{$S}"), tmp_buffer);
   }
   
-#if !defined(ARDUINO) || defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
+#if !defined(ARDUINO) || defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
   if(read_from_file(ifkey_filename, tmp_buffer)) {
     bfill.emit_p(PSTR(",\"ifkey\":\"$S\""), tmp_buffer);
   }
 #endif
 
+#ifdef ESP8266
+  bfill.emit_p(PSTR(",\"RSSI\":$D"), (int16_t)WiFi.RSSI());
+#endif
   bfill.emit_p(PSTR("}"));
-  delay(1);
+  INSERT_DELAY(1);
 }
 
 /** Output controller variables in json */
-byte server_json_controller(char *p) {
+void server_json_controller() {
+#ifdef ESP8266
+  if(!process_password()) return;
+  rewind_ether_buffer();
+#endif
+
   print_json_header();
   server_json_controller_main();
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
 /** Output homepage */
-byte server_home()
+void server_home()
 {
-  print_html_standard_header();
-  bfill.emit_p(PSTR("<!DOCTYPE html>\n<html>\n<head>\n$F</head>\n<body>\n<script>"), htmlMobileHeader);
+#ifdef ESP8266
+  rewind_ether_buffer();
+#endif
 
+  print_html_standard_header();
+  
+  bfill.emit_p(PSTR("<!DOCTYPE html>\n<html>\n<head>\n$F</head>\n<body>\n<script>"), htmlMobileHeader);
   // send server variables and javascript packets
   bfill.emit_p(PSTR("var ver=$D,ipas=$D;</script>\n"),
                OS_FW_VERSION, os.options[OPTION_IGNORE_PASSWORD]);
+
   bfill.emit_p(PSTR("<script src=\"$E/home.js\"></script>\n</body>\n</html>"), ADDR_NVM_JAVASCRIPTURL);
-  return HTML_OK;
+
+  handle_return(HTML_OK);
 }
 
 /**
  * Change controller variables
- * Command: /cv?pw=xxx&rsn=x&rbt=x&en=x&rd=x&sl=x
+ * Command: /cv?pw=xxx&rsn=x&rbt=x&en=x&rd=x&re=x&ap=x
  *
  * pw:  password
  * rsn: reset all stations (0 or 1)
@@ -961,11 +1318,20 @@ byte server_home()
  * en:  enable (0 or 1)
  * rd:  rain delay hours (0 turns off rain delay)
  * re:  remote extension mode
+ * ap:  reset to ap (ESP8266 only)
  * update: launch update script (for OSPi/OSBo/Linux only)
  */
-
-byte server_change_values(char *p)
+void server_change_values()
 {
+#ifdef ESP8266
+  char* p = NULL;
+  extern unsigned long reboot_timer;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif  
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rsn"), true)) {
     reset_all_stations();
   }
@@ -977,12 +1343,16 @@ byte server_change_values(char *p)
     }
 #endif
 
-#define TIME_REBOOT_DELAY  20
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rbt"), true) && atoi(tmp_buffer) > 0) {
-    print_html_standard_header();
-    //bfill.emit_p(PSTR("Rebooting..."));
-    send_packet(true);
-    os.reboot_dev();
+    #ifdef ESP8266
+      reboot_timer = millis() + 1000;
+      handle_return(HTML_SUCCESS);
+    #else
+      print_html_standard_header();
+      //bfill.emit_p(PSTR("Rebooting..."));
+      send_packet(true);
+      os.reboot_dev();
+    #endif
   }
 
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
@@ -997,7 +1367,7 @@ byte server_change_values(char *p)
       os.raindelay_start();
     } else if (rd==0){
       os.raindelay_stop();
-    } else  return HTML_DATA_OUTOFBOUND;
+    } else  handle_return(HTML_DATA_OUTOFBOUND);
   }
 
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("re"), true)) {
@@ -1009,7 +1379,13 @@ byte server_change_values(char *p)
       os.options_save();
     }
   }
-  return HTML_SUCCESS;
+  
+  #ifdef ESP8266
+  if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ap"), true)) {
+    os.reset_to_ap();
+  }  
+  #endif
+  handle_return(HTML_SUCCESS);
 }
 
 // remove spaces from a string
@@ -1031,10 +1407,18 @@ void string_remove_space(char *src) {
  * pw:  password
  * jsp: Javascript path
  */
-byte server_change_scripturl(char *p)
-{
+void server_change_scripturl() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else  
+  char* p = get_buffer;
+#endif
+  
 #if defined(DEMO)
-  return HTML_REDIRECT_HOME;
+  handle_return(HTML_REDIRECT_HOME);
 #endif
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("jsp"), true)) {
     urlDecode(tmp_buffer);
@@ -1049,7 +1433,7 @@ byte server_change_scripturl(char *p)
     string_remove_space(tmp_buffer);
     nvm_write_block(tmp_buffer, (void *)ADDR_NVM_WEATHERURL, strlen(tmp_buffer)+1);
   }
-  return HTML_REDIRECT_HOME;
+  handle_return(HTML_REDIRECT_HOME);
 }
 
 /**
@@ -1062,8 +1446,17 @@ byte server_change_scripturl(char *p)
  * wtkey: weather underground api key
  * ttt: manual time (applicable only if ntp=0)
  */
-byte server_change_options(char *p)
+void server_change_options()
 {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else  
+  char* p = get_buffer;
+#endif
+
   // temporarily save some old options values
 	bool time_change = false;
 	bool weather_change = false;
@@ -1076,7 +1469,6 @@ byte server_change_options(char *p)
   byte prev_value;
   byte max_value;
   for (byte oid=0; oid<NUM_OPTIONS; oid++) {
-    //if ((os.options[oid].flag&OPFLAG_WEB_EDIT)==0) continue;
 
     // skip options that cannot be set through /co command
     if (oid==OPTION_RESET || oid==OPTION_DEVICE_ENABLE ||
@@ -1099,8 +1491,8 @@ byte server_change_options(char *p)
 		        oid==OPTION_STATION_DELAY_TIME) {
 		      v=water_time_encode_signed(v);
 		    } // encode station delay time
-        #if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__)
-        if(os.hw_type==HW_TYPE_DC && oid==OPTION_BOOST_TIME) {
+        #if defined(__AVR_ATmega1284P__) || defined(__AVR_ATmega1284__) || defined(ESP8266)
+        if(oid==OPTION_BOOST_TIME) {
            v>>=2;
         }
         #endif
@@ -1162,14 +1554,12 @@ byte server_change_options(char *p)
   }
   if(findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("wto"), true)) {
     urlDecode(tmp_buffer);
-    tmp_buffer[TMP_BUFFER_SIZE]=0;
+    tmp_buffer[TMP_BUFFER_SIZE-1]=0;
     // store weather key
     write_to_file(wtopts_filename, tmp_buffer, strlen(tmp_buffer));
     weather_change = true;
   }
-  if (err) {
-    return HTML_DATA_OUTOFBOUND;
-  }
+  if (err)  handle_return(HTML_DATA_OUTOFBOUND);
 
   os.options_save();
 
@@ -1186,7 +1576,7 @@ byte server_change_options(char *p)
     // this would require a restart to take effect
   }
 
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 /**
@@ -1197,23 +1587,33 @@ byte server_change_options(char *p)
  * npw: new password
  * cpw: confirm new password
  */
-byte server_change_password(char *p)
-{
+void server_change_password() {
+#if defined(DEMO)
+  handle_return(HTML_SUCCESS);  // do not allow chnaging password for demo
+  return;
+#endif
+
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("npw"), true)) {
     char tbuf2[TMP_BUFFER_SIZE];
     if (findKeyVal(p, tbuf2, TMP_BUFFER_SIZE, PSTR("cpw"), true) && strncmp(tmp_buffer, tbuf2, MAX_USER_PASSWORD) == 0) {
-      #if defined(DEMO)
-        return HTML_SUCCESS;
-      #endif
       urlDecode(tmp_buffer);
       tmp_buffer[MAX_USER_PASSWORD-1]=0;  // make sure we don't exceed the maximum size
       nvm_write_block(tmp_buffer, (void*)ADDR_NVM_PASSWORD, strlen(tmp_buffer)+1);
-      return HTML_SUCCESS;
+      handle_return(HTML_SUCCESS);
     } else {
-      return HTML_MISMATCH;
+      handle_return(HTML_MISMATCH);
     }
+    return;
   }
-  return HTML_DATA_MISSING;
+  handle_return(HTML_DATA_MISSING);
 }
 
 void server_json_status_main() {
@@ -1225,15 +1625,19 @@ void server_json_status_main() {
     if(sid!=os.nstations-1) bfill.emit_p(PSTR(","));
   }
   bfill.emit_p(PSTR("],\"nstations\":$D}"), os.nstations);
-  delay(1);
+  INSERT_DELAY(1);
 }
 
 /** Output station status */
-byte server_json_status(char *p)
+void server_json_status()
 {
+#ifdef ESP8266
+  if(!process_password()) return;
+  rewind_ether_buffer();
+#endif
   print_json_header();
   server_json_status_main();
-  return HTML_OK;
+  handle_return(HTML_OK);
 }
 
 /**
@@ -1245,20 +1649,29 @@ byte server_json_status(char *p)
  * en: enable (0 or 1)
  * t:  timer (required if en=1)
  */
-byte server_change_manual(char *p) {
+void server_change_manual() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
+#endif
+
   int sid=-1;
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
     sid=atoi(tmp_buffer);
-    if (sid<0 || sid>=os.nstations) return HTML_DATA_OUTOFBOUND;
+    if (sid<0 || sid>=os.nstations) handle_return(HTML_DATA_OUTOFBOUND);
   } else {
-    return HTML_DATA_MISSING;
+    handle_return(HTML_DATA_MISSING);
   }
 
   byte en=0;
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("en"), true)) {
     en=atoi(tmp_buffer);
   } else {
-    return HTML_DATA_MISSING;
+    handle_return(HTML_DATA_MISSING);
   }
 
   uint16_t timer=0;
@@ -1267,7 +1680,7 @@ byte server_change_manual(char *p) {
     if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("t"), true)) {
       timer=(uint16_t)atol(tmp_buffer);
       if (timer==0 || timer>64800) {
-        return HTML_DATA_OUTOFBOUND;
+        handle_return(HTML_DATA_OUTOFBOUND);
       }
       // schedule manual station
       // skip if the station is a master station
@@ -1275,7 +1688,7 @@ byte server_change_manual(char *p) {
       byte bid = sid>>3;
       byte s = sid&0x07;
       if ((os.status.mas==sid+1) || (os.status.mas2==sid+1))
-        return HTML_NOT_PERMITTED;
+        handle_return(HTML_NOT_PERMITTED);
 
       RuntimeQueueStruct *q = NULL;
       byte sqi = pd.station_qid[sid];
@@ -1293,17 +1706,32 @@ byte server_change_manual(char *p) {
         q->pid = 99;  // testing stations are assigned program index 99
         schedule_all_stations(curr_time);
       } else {
-        return HTML_NOT_PERMITTED;
+        handle_return(HTML_NOT_PERMITTED);
       }
     } else {
-      return HTML_DATA_MISSING;
+      handle_return(HTML_DATA_MISSING);
     }
   } else {  // turn off station
     turn_off_station(sid, curr_time);
   }
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
+
+#ifdef ESP8266
+int file_fgets(File file, char* buf, int maxsize) {
+  int index=0;
+  while(index<maxsize) {
+    int c = file.read();
+    if(c<0||c=='\n') break;
+    if(c=='\r') continue; // skip \r
+    *buf++ = (char)c;
+    index++;
+  }
+  return index;
+}
+
+#endif
 /**
  * Get log data
  * Command: /jl?start=x&end=x&hist=x&type=x
@@ -1317,34 +1745,41 @@ byte server_change_manual(char *p) {
  *        rs, rd, wl
  *        if unspecified, output all records
  */
-byte server_json_log(char *p) {
+void server_json_log() {
 
-#if defined(ARDUINO)
-  // if no sd card, return false
-  if (!os.status.has_sd)  return HTML_PAGE_NOT_FOUND;
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;  
+  if (m_client)
+    p = get_buffer;
+#else
+  char* p = get_buffer;
 #endif
+
+  // if no sd card, return false
+  if (!os.status.has_sd)  handle_return(HTML_PAGE_NOT_FOUND);
 
   unsigned int start, end;
 
   // past n day history
   if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("hist"), true)) {
     int hist = atoi(tmp_buffer);
-    if (hist< 0 || hist > 365) return HTML_DATA_OUTOFBOUND;
+    if (hist< 0 || hist > 365) handle_return(HTML_DATA_OUTOFBOUND);
     end = os.now_tz() / 86400L;
     start = end - hist;
   }
   else
   {
-    if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("start"), true))
-      return HTML_DATA_MISSING;
+    if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("start"), true)) handle_return(HTML_DATA_MISSING);
+
     start = atol(tmp_buffer) / 86400L;
 
-    if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("end"), true))
-      return HTML_DATA_MISSING;
+    if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("end"), true)) handle_return(HTML_DATA_MISSING);
+    
     end = atol(tmp_buffer) / 86400L;
 
     // start must be prior to end, and can't retrieve more than 365 days of data
-    if ((start>end) || (end-start)>365)  return HTML_DATA_OUTOFBOUND;
+    if ((start>end) || (end-start)>365)  handle_return(HTML_DATA_OUTOFBOUND);
   }
 
   // extract the type parameter
@@ -1353,7 +1788,21 @@ byte server_json_log(char *p) {
   if (findKeyVal(p, type, 4, PSTR("type"), true))
     type_specified = true;
 
+#ifdef ESP8266
+  if (!m_client) {
+    // as the log data can be large, we will use ESP8266's sendContent function to
+    // send multiple packets of data, instead of the standard way of using send().
+    rewind_ether_buffer();
+    bfill.emit_p(PSTR("$F$F$F$F\r\n"), html200OK, htmlContentJSON, htmlAccessControl, htmlNoCache);
+    wifi_server->sendContent(ether_buffer);
+    rewind_ether_buffer();
+  } else {
+    print_json_header(false);
+  }
+#else
   print_json_header(false);
+#endif
+
   bfill.emit_p(PSTR("["));
 
   bool comma = 0;
@@ -1361,24 +1810,34 @@ byte server_json_log(char *p) {
     itoa(i, tmp_buffer, 10);
     make_logfile_name(tmp_buffer);
 
-#if defined(ARDUINO)  // prepare to open log file for Arduino
+#if defined(ARDUINO) && !defined(ESP8266)  // prepare to open log file for Arduino
     if (!sd.exists(tmp_buffer)) continue;
     SdFile file;
     file.open(tmp_buffer, O_READ);
+#elif defined(ESP8266)
+    File file = SPIFFS.open(tmp_buffer, "r");
+    if(!file) continue;
 #else // prepare to open log file for RPI/BBB
-    FILE *file;
-    file = fopen(get_filename_fullpath(tmp_buffer), "rb");
+    FILE *file = fopen(get_filename_fullpath(tmp_buffer), "rb");
     if(!file) continue;
 #endif // prepare to open log file
 
     int res;
     while(true) {
-    #if defined(ARDUINO)
+    #if defined(ARDUINO) && !defined(ESP8266)
       res = file.fgets(tmp_buffer, TMP_BUFFER_SIZE);
       if (res <= 0) {
         file.close();
         break;
       }
+    #elif defined(ESP8266)
+      // do not use file.readBytes or readBytesUntil because it's very slow
+      int res = file_fgets(file, tmp_buffer, TMP_BUFFER_SIZE);
+      if (res <= 0) {
+        file.close();
+        break;
+      }
+      tmp_buffer[res]=0;
     #else
       if(fgets(tmp_buffer, TMP_BUFFER_SIZE, file)) {
         res = strlen(tmp_buffer);
@@ -1420,8 +1879,12 @@ byte server_json_log(char *p) {
   }
 
   bfill.emit_p(PSTR("]"));
-  delay(1);
-  return HTML_OK;
+  INSERT_DELAY(1);
+#ifdef ESP8266
+  send_packet(true);
+#else
+  handle_return(HTML_OK);
+#endif
 }
 /**
  * Delete log
@@ -1432,18 +1895,30 @@ byte server_json_log(char *p) {
  * day:day (epoch time / 86400)
  * if day=all: delete all log files)
  */
-byte server_delete_log(char *p) {
+void server_delete_log() {
+#ifdef ESP8266
+  char* p = NULL;
+  if(!process_password()) return;
+  if (m_client)
+    p = get_buffer;
+#else  
+  char* p = get_buffer;
+#endif
 
   if (!findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("day"), true))
-    return HTML_DATA_MISSING;
+    handle_return(HTML_DATA_MISSING);
 
   delete_log(tmp_buffer);
 
-  return HTML_SUCCESS;
+  handle_return(HTML_SUCCESS);
 }
 
 /** Output all JSON data, including jc, jp, jo, js, jn */
-byte server_json_all(char *p) {
+void server_json_all() {
+#ifdef ESP8266
+  if(!process_password(true)) return;
+  rewind_ether_buffer();
+#endif
   print_json_header();
   bfill.emit_p(PSTR("\"settings\":{"));
   server_json_controller_main();
@@ -1460,16 +1935,11 @@ byte server_json_all(char *p) {
   bfill.emit_p(PSTR(",\"stations\":{"));
   server_json_stations_main();
   bfill.emit_p(PSTR("}"));
-  delay(1);
-  return HTML_OK;
+  INSERT_DELAY(1);
+  handle_return(HTML_OK);
 }
 
-typedef byte (*URLHandler)(char*);
-/*struct URLStruct{
-  PGM_P PROGMEM url;
-
-};*/
-
+typedef void (*URLHandler)(void);
 
 /* Server function urls
  * To save RAM space, each GET command keyword is exactly
@@ -1526,9 +1996,148 @@ URLHandler urls[] = {
 };
 
 // handle Ethernet request
+#ifdef ESP8266
+void on_ap_update() {
+  String html = FPSTR(ap_update_html);
+  server_send_html(html);
+}
+
+void on_sta_update() {
+  String html = FPSTR(sta_update_html);
+  server_send_html(html);
+}
+
+void on_sta_upload_fin() {
+  if(!process_password()) {
+    Update.reset();
+    return;
+  }
+  // finish update and check error
+  if(!Update.end(true) || Update.hasError()) {
+    handle_return(HTML_UPLOAD_FAILED);
+  }
+  
+  server_send_result(HTML_SUCCESS);
+  os.reboot_dev();
+}
+
+void on_ap_upload_fin() { on_sta_upload_fin(); }
+
+void on_sta_upload() {
+  HTTPUpload& upload = wifi_server->upload();
+  if(upload.status == UPLOAD_FILE_START){
+    WiFiUDP::stopAll();
+    DEBUG_PRINT(F("upload: "));
+    DEBUG_PRINTLN(upload.filename);
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000;
+    if(!Update.begin(maxSketchSpace)) {
+      DEBUG_PRINT(F("begin failed "));
+      DEBUG_PRINTLN(maxSketchSpace);
+    }
+    
+  } else if(upload.status == UPLOAD_FILE_WRITE) {
+    DEBUG_PRINT(".");
+    if(Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      DEBUG_PRINTLN(F("size mismatch"));
+    }
+      
+  } else if(upload.status == UPLOAD_FILE_END) {
+    
+    DEBUG_PRINTLN(F("completed"));
+   
+  } else if(upload.status == UPLOAD_FILE_ABORTED){
+    Update.end();
+    DEBUG_PRINTLN(F("aborted"));
+  }
+  delay(0);    
+}
+
+void on_ap_upload() { 
+  HTTPUpload& upload = wifi_server->upload();
+  if(upload.status == UPLOAD_FILE_START){
+    DEBUG_PRINT(F("upload: "));
+    DEBUG_PRINTLN(upload.filename);
+    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace()-0x1000)&0xFFFFF000;
+    if(!Update.begin(maxSketchSpace)) {
+      DEBUG_PRINTLN(F("begin failed"));
+      DEBUG_PRINTLN(maxSketchSpace);      
+    }
+  } else if(upload.status == UPLOAD_FILE_WRITE) {
+    DEBUG_PRINT(".");
+    if(Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      DEBUG_PRINTLN(F("size mismatch"));
+    }
+      
+  } else if(upload.status == UPLOAD_FILE_END) {
+    
+    DEBUG_PRINTLN(F("completed"));
+       
+  } else if(upload.status == UPLOAD_FILE_ABORTED){
+    Update.end();
+    DEBUG_PRINTLN(F("aborted"));
+  }
+  delay(0);
+}
+
+void start_server_client() {
+	if(!wifi_server) return;
+	
+  wifi_server->on("/", server_home);  // handle home page
+  wifi_server->on("/index.html", server_home);
+  wifi_server->on("/update", HTTP_GET, on_sta_update); // handle firmware update
+  wifi_server->on("/update", HTTP_POST, on_sta_upload_fin, on_sta_upload);  
+  
+  // set up all other handlers
+  char uri[4];
+  uri[0]='/';
+  uri[3]=0;
+  for(int i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
+    uri[1]=pgm_read_byte(_url_keys+2*i);
+    uri[2]=pgm_read_byte(_url_keys+2*i+1);
+    wifi_server->on(uri, urls[i]);
+  }
+  wifi_server->begin();
+}
+
+void start_server_ap() {
+
+	if(!wifi_server) return;
+	
+  scanned_ssids = scan_network();
+  String ap_ssid = get_ap_ssid();
+  start_network_ap(ap_ssid.c_str(), NULL);
+  delay(500);
+  wifi_server->on("/", on_ap_home);
+  wifi_server->on("/jsap", on_ap_scan);
+  wifi_server->on("/ccap", on_ap_change_config);
+  wifi_server->on("/jtap", on_ap_try_connect);
+  wifi_server->on("/update", HTTP_GET, on_ap_update);
+  wifi_server->on("/update", HTTP_POST, on_ap_upload_fin, on_ap_upload);
+  wifi_server->onNotFound(on_ap_home);
+
+  // set up all other handlers
+  char uri[4];
+  uri[0]='/';
+  uri[3]=0;
+  for(int i=0;i<sizeof(urls)/sizeof(URLHandler);i++) {
+    uri[1]=pgm_read_byte(_url_keys+2*i);
+    uri[2]=pgm_read_byte(_url_keys+2*i+1);
+    wifi_server->on(uri, urls[i]);
+  }
+  
+  wifi_server->begin();
+  os.lcd.setCursor(0, -1);
+  os.lcd.print(F("OSAP:"));
+  os.lcd.print(ap_ssid);
+  os.lcd.setCursor(0, 2);
+  os.lcd.print(WiFi.softAPIP());
+}
+
+#endif
+
 void handle_web_request(char *p)
 {
-#if defined(ARDUINO)
+#if defined(ARDUINO) && !defined(ESP8266)
   ether.httpServerReplyAck();
 #endif
   rewind_ether_buffer();
@@ -1549,28 +2158,52 @@ void handle_web_request(char *p)
        &&pgm_read_byte(_url_keys+2*i+1)==com[1]) {
 
         // check password
-        byte ret = HTML_UNAUTHORIZED;
+        int ret = HTML_UNAUTHORIZED;
 
         if (com[0]=='s' && com[1]=='u') { // for /su do not require password
-          ret = (urls[i])(dat);
+          get_buffer = dat;
+          (urls[i])();
+          ret = return_code;
         } else if ((com[0]=='j' && com[1]=='o') ||
                    (com[0]=='j' && com[1]=='a'))  { // for /jo and /ja we output fwv if password fails
-          if(check_password(dat)==false) {
+#ifdef ESP8266
+					if(process_password(false, dat)==false) {
+#else
+					if(check_password(dat)==false) {
+#endif
             print_json_header();
             bfill.emit_p(PSTR("\"$F\":$D}"),
                    op_json_names+0, os.options[0]);
             ret = HTML_OK;
           } else {
-            ret = (urls[i])(dat);
+            get_buffer = dat;
+            (urls[i])();
+            ret = return_code;
           }
         } else {
           // first check password
-          if(check_password(dat)==false) {
+#ifdef ESP8266
+					if(process_password(false, dat)==false) {
+#else
+					if(check_password(dat)==false) {
+#endif
             ret = HTML_UNAUTHORIZED;
           } else {
-            ret = (urls[i])(dat);
+            get_buffer = dat;
+            (urls[i])();
+            ret = return_code;
           }
         }
+        if (ret == -1) {
+          if (m_client)
+            m_client->stop();
+#ifdef ESP8266
+          else
+             wifi_server->client().stop();
+#endif
+          return;
+        }
+          
         switch(ret) {
         case HTML_OK:
           break;
@@ -1594,13 +2227,90 @@ void handle_web_request(char *p)
     send_packet(true);
   }
   //delay(50); // add a bit of delay here
+
 }
 
+#ifdef ESP8266
+#include "NTPClient.h"
+static EthernetUDP udp;
+static NTPClient *ntp = 0;
+extern EthernetServer *m_server;
+static char _ntpip[16];
+#endif
 
 #if defined(ARDUINO)
 /** NTP sync request */
-unsigned long getNtpTime()
-{
+ulong getNtpTime() {
+#ifdef ESP8266
+	if (m_server) {
+  	if (!ntp) {
+		  String ntpip = "";
+		  ntpip+=os.options[OPTION_NTP_IP1];
+		  ntpip+=".";
+		  ntpip+=os.options[OPTION_NTP_IP2];
+		  ntpip+=".";
+		  ntpip+=os.options[OPTION_NTP_IP3];
+		  ntpip+=".";
+		  ntpip+=os.options[OPTION_NTP_IP4];
+		  strcpy(_ntpip, ntpip.c_str());
+		  if (!os.options[OPTION_NTP_IP1] || os.options[OPTION_NTP_IP1] == '0')
+		    strcpy(_ntpip, "pool.ntp.org");
+
+		  ntp = new NTPClient(udp, _ntpip);
+		  ntp->begin();
+		  delay(1000);
+  	}
+	  ulong gt = 0;
+	  byte tick=0;
+		if (ntp->update()) {
+		  do {
+		    gt = ntp->getEpochTime();
+		    tick++;
+		    delay(1000);
+		  } while(gt<978307200L && tick<20);
+		  if(gt<978307200L) {
+		    DEBUG_PRINTLN(F("NTP-E failed!"));
+		    gt=0;
+		  } else {
+		    DEBUG_PRINTLN(F("NTP-E done."));
+		  }
+		}
+	  return gt;
+	}
+  static bool configured = false;
+    
+  if (os.state!=OS_STATE_CONNECTED || WiFi.status()!=WL_CONNECTED) return 0;
+  
+  if(!configured) {
+    String ntpip = "";
+    ntpip+=os.options[OPTION_NTP_IP1];
+    ntpip+=".";
+    ntpip+=os.options[OPTION_NTP_IP2];
+    ntpip+=".";
+    ntpip+=os.options[OPTION_NTP_IP3];
+    ntpip+=".";
+    ntpip+=os.options[OPTION_NTP_IP4];
+    
+    configTime(0, 0, "pool.ntp.org", ntpip.c_str(), "time.nist.gov");
+    delay(1000);
+    configured = true;
+  }
+  ulong gt = 0;
+  byte tick=0;
+  do {
+    gt = time(nullptr);
+    tick++;
+    delay(1000);
+  } while(gt<978307200L && tick<20);
+  if(gt<978307200L)  {
+    DEBUG_PRINTLN(F("NTP failed!"));
+    gt=0;
+  } else {
+    DEBUG_PRINTLN(F("NTP done."));
+  }  
+  return gt;
+  
+#else
   byte ntpip[4] = {
     os.options[OPTION_NTP_IP1],
     os.options[OPTION_NTP_IP2],
@@ -1626,6 +2336,9 @@ unsigned long getNtpTime()
     } while(millis() < expire);
     tick ++;
   } while(tick<20);
+#endif
   return 0;
 }
 #endif
+
+
